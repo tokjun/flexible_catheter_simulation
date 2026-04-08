@@ -34,7 +34,7 @@ Two generator scripts are provided:
 ├── catheter_urdf_generator.py                  # Passive simulation generator
 ├── cath_urdf_generator_with_controller.py      # Active control simulation generator
 └── test_anatomy/                               # Example anatomical model (e.g. aortic arch)
-    ├── meshes/                                 # Mesh files (.stl / .dae)
+    ├── meshes/                                 # Mesh files (.stl)
     ├── model.config                            # Gazebo model metadata
     └── model.sdf                               # Gazebo SDF model definition
 
