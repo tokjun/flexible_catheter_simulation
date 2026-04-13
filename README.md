@@ -6,6 +6,8 @@ Two generator scripts are provided:
 - **`catheter_urdf_generator.py`** — passive deformation simulation (observe catheter deflection under external forces)
 - **`cath_urdf_generator_with_controller.py`** — active control simulation with a 4-DOF motorized base and keyboard teleoperation
 
+Both scripts optionally accept an anatomy STL file (`--anatomy-stl`) so the anatomical model is automatically visible in **both Gazebo and RViz** at a specified pose, with no manual placement required.
+
 ---
 
 ## Table of Contents
@@ -18,7 +20,9 @@ Two generator scripts are provided:
 - [Usage](#usage)
   - [Passive Catheter Simulation](#passive-catheter-simulation)
   - [Controlled Catheter Simulation with Keyboard Teleop](#controlled-catheter-simulation-with-keyboard-teleop)
-- [Loading Anatomy in Gazebo](#loading-anatomy-in-gazebo)
+- [Including an Anatomy Model](#including-an-anatomy-model)
+  - [Automated (recommended)](#automated-recommended)
+  - [Manual placement in Gazebo only (legacy)](#manual-placement-in-gazebo-only-legacy)
 - [Catheter Model Parameters](#catheter-model-parameters)
 - [References](#references)
 
@@ -33,11 +37,10 @@ Two generator scripts are provided:
 │   └── images/                                 # Screenshots for README
 ├── catheter_urdf_generator.py                  # Passive simulation generator
 ├── cath_urdf_generator_with_controller.py      # Active control simulation generator
-└── test_anatomy/                               # Example anatomical model (e.g. aortic arch)
+└── test_anatomy/                               # Example anatomical model (aortic arch)
     ├── meshes/                                 # Mesh files (.stl)
     ├── model.config                            # Gazebo model metadata
     └── model.sdf                               # Gazebo SDF model definition
-
 ```
 
 Each generator script produces a self-contained **ROS2 package** in the specified output directory:
@@ -46,10 +49,10 @@ Each generator script produces a self-contained **ROS2 package** in the specifie
 <output_package>/
 ├── package.xml
 ├── CMakeLists.txt
-├── urdf/               # Xacro robot description
+├── urdf/               # Xacro robot description (includes anatomy link when configured)
 ├── sdf/                # Gazebo SDF model
-├── meshes/             # Auto-generated STL cylinder meshes per link
-├── worlds/             # Gazebo world file
+├── meshes/             # Auto-generated STL cylinder meshes + anatomy STL (when configured)
+├── worlds/             # Gazebo world file (includes anatomy model when configured)
 ├── launch/             # ROS2 launch file
 └── scripts/            # catheter_keyboard_teleop.py  (controller variant only)
 ```
@@ -104,6 +107,16 @@ python3 catheter_urdf_generator.py \
     --K 0.2 --M 0.5 --output my_catheter
 ```
 
+To include the aortic anatomy model at a specified pose:
+
+```bash
+python3 catheter_urdf_generator.py \
+    --N 12 --D 0.003 --L1 0.20 --L2 0.5 --L3 0.05 \
+    --K 0.2 --M 0.5 --output my_catheter \
+    --anatomy-stl /path/to/test_anatomy/meshes/Aortic_NIH3D_v2.stl \
+    --anatomy-x 0.0 --anatomy-y -0.02 --anatomy-z 0.56
+```
+
 **Step 2: Build and launch**
 
 ```bash
@@ -131,6 +144,17 @@ python3 cath_urdf_generator_with_controller.py \
     --N 50 --D 0.003 --L1 0.04 --L2 0.5 --L3 0.01 \
     --K 10.0 --Kd 0.1 --Kf 0.01 --M 0.5 \
     --output control_catheter_test
+```
+
+To include the aortic anatomy model:
+
+```bash
+python3 cath_urdf_generator_with_controller.py \
+    --N 50 --D 0.003 --L1 0.04 --L2 0.5 --L3 0.01 \
+    --K 10.0 --Kd 0.1 --Kf 0.01 --M 0.5 \
+    --output control_catheter_test \
+    --anatomy-stl /path/to/test_anatomy/meshes/Aortic_NIH3D_v2.stl \
+    --anatomy-x 0.0 --anatomy-y -0.02 --anatomy-z 0.56
 ```
 
 **Step 2: Build and launch**
@@ -168,13 +192,35 @@ The teleop node publishes to the following ROS2 topics:
 - `/base_z_joint/cmd_pos`
 - `/base_rotation_joint/cmd_pos`
 
-> **Tip:** Before teleoperating, position the anatomy model to an appropriate pose in Gazebo first. For the included `test_anatomy`, a good starting pose is `x=0, y=-0.02, z=0.56` (adjust Z first to align the catheter with the vessel entry).
-
 ---
 
-## Loading Anatomy in Gazebo
+## Including an Anatomy Model
 
-The `test_anatomy/` folder contains an example anatomical model (e.g., aortic arch). Follow these steps to load it into the simulation.
+### Automated (recommended)
+
+Pass `--anatomy-stl` to either generator script. The STL is copied into the package's `meshes/` directory and the anatomy is registered in both the URDF and the Gazebo world file — so it appears in **RViz and Gazebo automatically** at the pose you specify, with no manual drag-and-drop required.
+
+```bash
+python3 catheter_urdf_generator.py \
+    --output my_catheter \
+    --anatomy-stl test_anatomy/meshes/Aortic_NIH3D_v2.stl \
+    --anatomy-x 0.0 --anatomy-y -0.02 --anatomy-z 0.56 \
+    --anatomy-roll 0.0 --anatomy-pitch 0.0 --anatomy-yaw 0.0
+```
+
+**How it works:**
+
+- **URDF**: an `anatomy_link` is added as a fixed child of the `world` frame at the specified pose. `robot_state_publisher` broadcasts its TF, so RViz renders it via the **RobotModel** display.
+- **Gazebo world SDF**: the anatomy model is embedded inline at the same pose, so Gazebo loads it on startup.
+- **Launch file**: an `OpaqueFunction` resolves the installed path of the anatomy STL at launch time and patches the world SDF before handing it to Gazebo.
+
+After building and launching, set the **Fixed Frame** in RViz to `world` and add a **RobotModel** display to see both the catheter and the anatomy.
+
+> **Tip:** The default scale factor (`--anatomy-scale 0.001`) converts the STL from millimetres to metres, which matches the `test_anatomy` model. Adjust if your STL is already in metres.
+
+### Manual placement in Gazebo only (legacy)
+
+If you prefer to place the anatomy interactively in Gazebo without it appearing in RViz:
 
 **Step 1: Set up the anatomy resource directory**
 
@@ -197,7 +243,7 @@ source ~/.bashrc
 **Step 3: Launch the simulation and import the anatomy**
 
 In Gazebo:
-1. Open the plugin menu and search for **Resource Spawner** 
+1. Open the plugin menu and search for **Resource Spawner**
 ![Gazebo Resource Spawner](docs/images/ImportAnatomy_1.png)
 ![Gazebo Resource Spawner](docs/images/ImportAnatomy_2.png)
 2. Find `test_anatomy` in the resource list
@@ -229,6 +275,19 @@ The controller variant adds two additional parameters:
 |-----------|-------------|------|---------|
 | `--Kd` | Joint damping coefficient | — | `0.1` |
 | `--Kf` | Joint friction coefficient | — | `0.01` |
+
+Both scripts also accept the following optional anatomy parameters:
+
+| Parameter | Description | Unit | Default |
+|-----------|-------------|------|---------|
+| `--anatomy-stl` | Path to anatomy STL file | — | *(none)* |
+| `--anatomy-x` | Anatomy X position in world frame | m | `0.0` |
+| `--anatomy-y` | Anatomy Y position in world frame | m | `0.0` |
+| `--anatomy-z` | Anatomy Z position in world frame | m | `0.0` |
+| `--anatomy-roll` | Anatomy roll in world frame | rad | `0.0` |
+| `--anatomy-pitch` | Anatomy pitch in world frame | rad | `0.0` |
+| `--anatomy-yaw` | Anatomy yaw in world frame | rad | `0.0` |
+| `--anatomy-scale` | Mesh scale factor (mm→m conversion) | — | `0.001` |
 
 The catheter structure consists of a base link (length `L1`), a bending section of `N-2` uniformly distributed links (total length `L2`), and a tip link (length `L3`). Mass is distributed proportionally to each section's length. Spring stiffness decreases distally by a factor of 0.85 per joint to approximate the softer tip behavior of real catheters.
 

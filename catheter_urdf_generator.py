@@ -27,7 +27,9 @@ import os
 
 
 class CatheterXacroGenerator:
-    def __init__(self, N, D, L1, L2, L3, K, Kd, Kf, M, package_dir="catheter_package"):
+    def __init__(self, N, D, L1, L2, L3, K, Kd, Kf, M, package_dir="catheter_package",
+                 anatomy_stl=None, anatomy_xyz=(0, 0, 0), anatomy_rpy=(0, 0, 0),
+                 anatomy_scale=0.001):
         self.N = N
         self.D = D
         self.L1 = L1
@@ -38,6 +40,10 @@ class CatheterXacroGenerator:
         self.friction = Kf
         self.M = M
         self.package_dir = package_dir
+        self.anatomy_stl = anatomy_stl
+        self.anatomy_xyz = anatomy_xyz
+        self.anatomy_rpy = anatomy_rpy
+        self.anatomy_scale = anatomy_scale
         self.meshes_dir = os.path.join(package_dir, "meshes")
         self.urdf_dir = os.path.join(package_dir, "urdf")
         self.sdf_dir = os.path.join(package_dir, "sdf")
@@ -484,26 +490,46 @@ ament_package()'''
         package_name = os.path.basename(self.package_dir)
         launch_filename = f"{package_name}_launch.py"
         sdf_filename = xacro_filename.replace('.xacro', '.sdf')
-        
-        launch_content = f'''# Copyright 2019 Open Source Robotics Foundation, Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-import os
+        if self.anatomy_stl:
+            anatomy_basename = os.path.basename(self.anatomy_stl)
+            gazebo_block = f'''
+    def _launch_gazebo(context):
+        """Resolve installed anatomy mesh path and write a temp world SDF."""
+        pkg = get_package_share_directory('{package_name}')
+        anatomy_mesh = os.path.join(pkg, 'meshes', '{anatomy_basename}')
+        world_tmpl = os.path.join(pkg, 'worlds', 'custom_world.sdf')
+        with open(world_tmpl, 'r') as f:
+            content = f.read().replace('__ANATOMY_MESH_PATH__', anatomy_mesh)
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sdf', delete=False)
+        tmp.write(content)
+        tmp.close()
+        return [IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(get_package_share_directory('ros_gz_sim'),
+                             'launch', 'gz_sim.launch.py')
+            ),
+            launch_arguments={{'gz_args': f'-r {{tmp.name}}'}}.items(),
+        )]
+
+    gazebo_action = OpaqueFunction(function=_launch_gazebo)'''
+            extra_imports = '\nfrom launch.actions import IncludeLaunchDescription, OpaqueFunction'
+        else:
+            gazebo_block = f'''
+    custom_world_file = os.path.join(pkg_share, 'worlds', 'custom_world.sdf')
+    gazebo_action = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py')
+        ),
+        launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
+    )'''
+            extra_imports = '\nfrom launch.actions import IncludeLaunchDescription'
+
+        launch_content = f'''import os
 
 from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch import LaunchDescription{extra_imports}
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 import xacro
@@ -520,7 +546,7 @@ def generate_launch_description():
     robot_description_config = xacro.process_file(robot_description_file)
     robot_description = {{'robot_description': robot_description_config.toxml()}}
 
-    # Robot state publisher
+    # Robot state publisher (publishes TF for catheter and anatomy)
     robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -535,15 +561,6 @@ def generate_launch_description():
         executable='joint_state_publisher_gui',
         name='joint_state_publisher_gui',
         output='screen'
-    )
-
-    # Gazebo Sim with custom world
-    custom_world_file = os.path.join(pkg_share, 'worlds', 'custom_world.sdf')
-    gazebo = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py')
-        ),
-        launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
     )
 
     # RViz
@@ -576,16 +593,17 @@ def generate_launch_description():
         ],
         output='screen'
     )
+{gazebo_block}
 
     return LaunchDescription(
         [
-            # Launch Gazebo
-            gazebo,
+            # Launch Gazebo (with anatomy in world if configured)
+            gazebo_action,
             # Spawn the robot model
             spawn,
             # Bridge Gazebo and ROS2
             bridge,
-            # Publish robot state
+            # Publish robot state (includes anatomy TF when configured)
             robot_state_publisher,
             # Uncomment the next line to enable joint state publisher GUI
             # joint_state_publisher_gui,
@@ -594,17 +612,43 @@ def generate_launch_description():
         ]
     )
 '''
-        
-        # Save launch file
+
         launch_path = os.path.join(self.launch_dir, launch_filename)
         with open(launch_path, 'w') as f:
             f.write(launch_content)
-        
+
         return launch_path
     
     def generate_custom_world(self):
         """Generate custom world SDF file for Gazebo"""
-        world_content = '''<?xml version="1.0" ?>
+        anatomy_block = ''
+        if self.anatomy_stl:
+            ax, ay, az = self.anatomy_xyz
+            ar, ap, ayaw = self.anatomy_rpy
+            sc = self.anatomy_scale
+            anatomy_block = f'''
+    <!-- Anatomy model: mesh path (__ANATOMY_MESH_PATH__) resolved at launch time -->
+    <model name="anatomy">
+      <static>true</static>
+      <pose>{ax} {ay} {az} {ar} {ap} {ayaw}</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <mesh>
+              <uri>file://__ANATOMY_MESH_PATH__</uri>
+              <scale>{sc} {sc} {sc}</scale>
+            </mesh>
+          </geometry>
+          <material>
+            <ambient>0.8 0.2 0.2 1</ambient>
+            <diffuse>0.8 0.2 0.2 0.5</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>'''
+
+        world_content = f'''<?xml version="1.0" ?>
 <sdf version="1.6">
   <world name="catheter_world">
     <physics name="1ms" type="ignored">
@@ -656,7 +700,7 @@ def generate_launch_description():
         </visual>
       </link>
     </model>
-
+{anatomy_block}
   </world>
 </sdf>'''
         
@@ -737,7 +781,10 @@ def generate_launch_description():
         # Add macros
         self.add_catheter_link_macro(robot)
         self.add_universal_joint_macro(robot)
-        
+
+        # World virtual link (root frame, anchors both catheter and anatomy)
+        ET.SubElement(robot, 'link', name='world')
+
         # Use macros to create links
         # Link frame origin at joint, geometry extends from origin
         # Base link is now the root/parent
@@ -785,6 +832,35 @@ def generate_launch_description():
             ET.SubElement(robot, 'xacro:universal_joint',
                          name='base_to_tip', parent='base_link', child='tip_link',
                          xyz_origin=f'0 0 {self.L1}', spring_k='${spring_constant}')
+
+        # Fix base_link to world (world becomes the URDF root, matching the SDF)
+        j_world = ET.SubElement(robot, 'joint', name='world_to_base', type='fixed')
+        ET.SubElement(j_world, 'parent', link='world')
+        ET.SubElement(j_world, 'child', link='base_link')
+        ET.SubElement(j_world, 'origin', xyz='0 0 0', rpy='0 0 0')
+
+        # Anatomy link — fixed to world frame, visible in both RViz and Gazebo
+        if self.anatomy_stl:
+            anatomy_basename = os.path.basename(self.anatomy_stl)
+            anatomy_lk = ET.SubElement(robot, 'link', name='anatomy_link')
+            vis = ET.SubElement(anatomy_lk, 'visual')
+            ET.SubElement(vis, 'origin', xyz='0 0 0', rpy='0 0 0')
+            vis_geom = ET.SubElement(vis, 'geometry')
+            mesh_el = ET.SubElement(vis_geom, 'mesh')
+            mesh_el.set('filename', f'package://{package_name}/meshes/{anatomy_basename}')
+            mesh_el.set('scale',
+                        f'{self.anatomy_scale} {self.anatomy_scale} {self.anatomy_scale}')
+            anat_mat = ET.SubElement(vis, 'material', name='anatomy_material')
+            ET.SubElement(anat_mat, 'color', rgba='0.8 0.2 0.2 0.5')
+
+            j_anat = ET.SubElement(robot, 'joint', name='world_to_anatomy', type='fixed')
+            ET.SubElement(j_anat, 'parent', link='world')
+            ET.SubElement(j_anat, 'child', link='anatomy_link')
+            ET.SubElement(j_anat, 'origin',
+                          xyz=(f'{self.anatomy_xyz[0]} {self.anatomy_xyz[1]}'
+                               f' {self.anatomy_xyz[2]}'),
+                          rpy=(f'{self.anatomy_rpy[0]} {self.anatomy_rpy[1]}'
+                               f' {self.anatomy_rpy[2]}'))
 
         return robot
     
@@ -920,16 +996,23 @@ def generate_launch_description():
         # Generate ROS2 package files
         package_xml_path = self.generate_package_xml()
         cmake_path = self.generate_cmakelists_txt()
-        
+
+        # Copy anatomy STL into the package meshes directory
+        if self.anatomy_stl:
+            import shutil
+            anatomy_basename = os.path.basename(self.anatomy_stl)
+            shutil.copy2(self.anatomy_stl,
+                         os.path.join(self.meshes_dir, anatomy_basename))
+
         # Generate SDF file for Gazebo
         sdf_path = self.generate_sdf(filename)
-        
+
         # Generate launch file
         launch_path = self.generate_launch_file(filename)
-        
+
         # Generate custom world file
         world_path = self.generate_custom_world()
-        
+
         print(f"ROS2 package created: {self.package_dir}/")
         print(f"  Package files:")
         print(f"    - {os.path.relpath(package_xml_path, self.package_dir)}")
@@ -938,10 +1021,10 @@ def generate_launch_description():
         print(f"  SDF saved to: {os.path.relpath(sdf_path, self.package_dir)} (base fixed to world)")
         print(f"  World file saved to: {os.path.relpath(world_path, self.package_dir)}")
         print(f"  Launch file saved to: {os.path.relpath(launch_path, self.package_dir)}")
-        print(f"  STL files generated in: {os.path.relpath(self.meshes_dir, self.package_dir)}/")
-        print(f"    - tip_link.stl")
-        print(f"    - bending_link.stl") 
-        print(f"    - base_link.stl")
+        print(f"  STL files in: {os.path.relpath(self.meshes_dir, self.package_dir)}/")
+        print(f"    - tip_link.stl, bending_link.stl, base_link.stl")
+        if self.anatomy_stl:
+            print(f"    - {os.path.basename(self.anatomy_stl)}  (anatomy)")
 
 
 def main():
@@ -956,15 +1039,33 @@ def main():
     parser.add_argument("--Kf", type=float, default=0.01, help="Friction")
     parser.add_argument("--M", type=float, default=0.01, help="Total mass (kg)")
 
-    parser.add_argument("--output", type=str, default="catheter_package", 
+    parser.add_argument("--output", type=str, default="catheter_package",
                        help="Package directory name")
-    parser.add_argument("--xacro-name", type=str, default=None, 
+    parser.add_argument("--xacro-name", type=str, default=None,
                        help="Xacro filename to save in urdf/ directory (default: package_name.xacro)")
-    
+
+    # Anatomy model arguments (makes anatomy visible in both RViz and Gazebo)
+    parser.add_argument("--anatomy-stl", type=str, default=None,
+                       help="Path to anatomy STL file")
+    parser.add_argument("--anatomy-x",     type=float, default=0.0,   help="Anatomy X position (m)")
+    parser.add_argument("--anatomy-y",     type=float, default=0.0,   help="Anatomy Y position (m)")
+    parser.add_argument("--anatomy-z",     type=float, default=0.0,   help="Anatomy Z position (m)")
+    parser.add_argument("--anatomy-roll",  type=float, default=0.0,   help="Anatomy roll  (rad)")
+    parser.add_argument("--anatomy-pitch", type=float, default=0.0,   help="Anatomy pitch (rad)")
+    parser.add_argument("--anatomy-yaw",   type=float, default=0.0,   help="Anatomy yaw   (rad)")
+    parser.add_argument("--anatomy-scale", type=float, default=0.001,
+                       help="Anatomy mesh scale factor (default 0.001 converts mm→m)")
+
     args = parser.parse_args()
-    
+
     try:
-        generator = CatheterXacroGenerator(args.N, args.D, args.L1, args.L2, args.L3, args.K, args.Kd, args.Kf, args.M, args.output)
+        generator = CatheterXacroGenerator(
+            args.N, args.D, args.L1, args.L2, args.L3,
+            args.K, args.Kd, args.Kf, args.M, args.output,
+            anatomy_stl=args.anatomy_stl,
+            anatomy_xyz=(args.anatomy_x, args.anatomy_y, args.anatomy_z),
+            anatomy_rpy=(args.anatomy_roll, args.anatomy_pitch, args.anatomy_yaw),
+            anatomy_scale=args.anatomy_scale)
         generator.save_xacro(args.xacro_name)
         
         print(f"Generated catheter with parameters:")
