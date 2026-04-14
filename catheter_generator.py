@@ -694,14 +694,6 @@ ament_package()'''
     <model name="ground_plane">
       <static>true</static>
       <link name="link">
-        <collision name="collision">
-          <geometry>
-            <plane>
-              <normal>0 0 1</normal>
-              <size>100 100</size>
-            </plane>
-          </geometry>
-        </collision>
         <visual name="visual">
           <geometry>
             <plane>
