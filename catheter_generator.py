@@ -1009,16 +1009,22 @@ ament_package()'''
             '/model/{package_name}_model/pose@geometry_msgs/msg/PoseStamped[gz.msgs.Pose',
             '/world/catheter_world/model/{package_name}_model/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model','''
 
-        # Gazebo launch: always use OpaqueFunction so that anatomy mesh paths
-        # and the world SDF can be resolved at launch time.
-        if self.anatomy_models:
-            replace_lines = '\n'.join(
-                f"        content = content.replace("
-                f"'__ANATOMY_MESH_PATH_{i}__', "
-                f"os.path.join(pkg, 'meshes', '{os.path.basename(m['src_stl'])}'))"
-                for i, m in enumerate(self.anatomy_models)
-            )
-            gazebo_block = f'''
+        # ── Gazebo + spawn blocks ────────────────────────────────────────────
+        # Both modes use a separate Gazebo launch + spawn node.
+        # The spawn node positions the whole Gazebo model via LaunchConfiguration
+        # args (x/y/z/roll/pitch/yaw).  The initial pose is simultaneously baked
+        # into the URDF fixed joint via xacro mappings in rsp_block above, so
+        # Gazebo and RViz agree from the very first frame in both modes.
+        if not self.with_controller:
+            # ── Passive: separate Gazebo launch + spawn ──────────────────────
+            if self.anatomy_models:
+                replace_lines = '\n'.join(
+                    f"        content = content.replace("
+                    f"'__ANATOMY_MESH_PATH_{i}__', "
+                    f"os.path.join(pkg, 'meshes', '{os.path.basename(m['src_stl'])}'))"
+                    for i, m in enumerate(self.anatomy_models)
+                )
+                gazebo_block = f'''
     def _launch_gazebo(context):
         """Resolve installed anatomy mesh paths and write a temporary world SDF."""
         pkg = get_package_share_directory('{package_name}')
@@ -1039,8 +1045,8 @@ ament_package()'''
         )]
 
     gazebo_action = OpaqueFunction(function=_launch_gazebo)'''
-        else:
-            gazebo_block = f'''
+            else:
+                gazebo_block = f'''
     custom_world_file = os.path.join(pkg_share, 'worlds', 'custom_world.sdf')
     gazebo_action = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -1049,16 +1055,98 @@ ament_package()'''
         launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
     )'''
 
+            spawn_block = f'''
+    spawn = Node(
+        package='ros_gz_sim',
+        executable='create',
+        parameters=[{{
+            'name':  '{package_name}_model',
+            'file':  os.path.join(pkg_share, 'sdf', '{sdf_filename}'),
+            'x':     LaunchConfiguration('initial_x'),
+            'y':     LaunchConfiguration('initial_y'),
+            'z':     LaunchConfiguration('initial_z'),
+            'roll':  LaunchConfiguration('initial_roll'),
+            'pitch': LaunchConfiguration('initial_pitch'),
+            'yaw':   LaunchConfiguration('initial_yaw'),
+        }}],
+        output='screen',
+    )
+'''
+            ld_gazebo_spawn = '        gazebo_action,\n        spawn,'
+
+        else:
+            # ── Controller: separate Gazebo + spawn (mirrors passive mode) ───
+            # The fixed world_to_base_offset joint in the URDF carries the
+            # initial pose (baked via xacro in rsp_block below), so the spawn
+            # node just positions the Gazebo model at the same offset and the
+            # joint states (starting at 0) represent motion relative to it.
+            if self.anatomy_models:
+                replace_lines = '\n'.join(
+                    f"        content = content.replace("
+                    f"'__ANATOMY_MESH_PATH_{i}__', "
+                    f"os.path.join(pkg, 'meshes', '{os.path.basename(m['src_stl'])}'))"
+                    for i, m in enumerate(self.anatomy_models)
+                )
+                gazebo_block = f'''
+    def _launch_gazebo(context):
+        """Resolve installed anatomy mesh paths and write a temporary world SDF."""
+        pkg = get_package_share_directory('{package_name}')
+        world_tmpl = os.path.join(pkg, 'worlds', 'custom_world.sdf')
+        with open(world_tmpl, 'r') as f:
+            content = f.read()
+{replace_lines}
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.sdf', delete=False)
+        tmp.write(content)
+        tmp.close()
+        return [IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(get_package_share_directory('ros_gz_sim'),
+                             'launch', 'gz_sim.launch.py')
+            ),
+            launch_arguments={{'gz_args': f'-r {{tmp.name}}'}}.items(),
+        )]
+
+    gazebo_action = OpaqueFunction(function=_launch_gazebo)'''
+            else:
+                gazebo_block = f'''
+    custom_world_file = os.path.join(pkg_share, 'worlds', 'custom_world.sdf')
+    gazebo_action = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py')
+        ),
+        launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
+    )'''
+
+            spawn_block = f'''
+    spawn = Node(
+        package='ros_gz_sim',
+        executable='create',
+        parameters=[{{
+            'name':  '{package_name}_model',
+            'file':  os.path.join(pkg_share, 'sdf', '{sdf_filename}'),
+            'x':     LaunchConfiguration('initial_x'),
+            'y':     LaunchConfiguration('initial_y'),
+            'z':     LaunchConfiguration('initial_z'),
+            'roll':  LaunchConfiguration('initial_roll'),
+            'pitch': LaunchConfiguration('initial_pitch'),
+            'yaw':   LaunchConfiguration('initial_yaw'),
+        }}],
+        output='screen',
+    )
+'''
+            ld_gazebo_spawn = '        gazebo_action,\n        spawn,'
+
         # ── robot_state_publisher block ──────────────────────────────────────
-        # Passive mode: the initial pose is baked into the URDF at launch time
-        # via xacro args.  An OpaqueFunction resolves the launch args (which
-        # are strings) and passes them as xacro mappings so that RSP itself
-        # publishes the correct world→base_link on /tf_static.  This avoids
-        # any external broadcaster and any static-vs-dynamic TF conflict.
+        # Both modes bake the initial pose into the URDF via xacro args using
+        # an OpaqueFunction so that RSP publishes the correct /tf_static from
+        # the very first frame without any external broadcaster.
         #
-        # Controller mode: the URDF has no fixed world joint (the base is
-        # driven by prismatic/revolute joints whose states come from Gazebo),
-        # so we process xacro once at description time with no mappings.
+        # Passive mode: world_to_base fixed joint carries the initial pose.
+        # Controller mode: world_to_base_offset fixed joint carries the initial
+        # pose; the movable base joints (base_x/y/z/rotation) are rooted at
+        # base_origin (child of that fixed joint) so their joint states are
+        # relative offsets — consistent with the Gazebo spawn position.
         if not self.with_controller:
             rsp_block = f'''
     # ── robot_state_publisher (passive) ─────────────────────────────────────
@@ -1092,18 +1180,34 @@ ament_package()'''
         else:
             rsp_block = f'''
     # ── robot_state_publisher (controller) ──────────────────────────────────
-    config = xacro.process_file(
-        os.path.join(pkg_share, 'urdf', '{xacro_filename}')
-    )
-    rsp_node = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='both',
-        parameters=[{{'robot_description': config.toxml()}}],
-    )
+    # OpaqueFunction is required because LaunchConfiguration resolves to a
+    # string at launch time; we pass those strings as xacro mappings so the
+    # fixed world_to_base_offset joint carries the correct initial pose and
+    # RSP publishes /tf_static matching the Gazebo spawn position.
+    def _launch_rsp(context):
+        _pkg = get_package_share_directory('{package_name}')
+        _cfg = xacro.process_file(
+            os.path.join(_pkg, 'urdf', '{xacro_filename}'),
+            mappings={{
+                'initial_x':     LaunchConfiguration('initial_x').perform(context),
+                'initial_y':     LaunchConfiguration('initial_y').perform(context),
+                'initial_z':     LaunchConfiguration('initial_z').perform(context),
+                'initial_roll':  LaunchConfiguration('initial_roll').perform(context),
+                'initial_pitch': LaunchConfiguration('initial_pitch').perform(context),
+                'initial_yaw':   LaunchConfiguration('initial_yaw').perform(context),
+            }}
+        )
+        return [Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='both',
+            parameters=[{{'robot_description': _cfg.toxml()}}],
+        )]
+
+    rsp_action = OpaqueFunction(function=_launch_rsp)
 '''
-            rsp_ld_entry = '        rsp_node,'
+            rsp_ld_entry = '        rsp_action,'
 
         launch_content = f'''import os
 
@@ -1148,23 +1252,7 @@ def generate_launch_description():
         output='screen',
         arguments=['-d', rviz_config],
     )
-
-    spawn = Node(
-        package='ros_gz_sim',
-        executable='create',
-        parameters=[{{
-            'name':  '{package_name}_model',
-            'file':  os.path.join(pkg_share, 'sdf', '{sdf_filename}'),
-            'x':     LaunchConfiguration('initial_x'),
-            'y':     LaunchConfiguration('initial_y'),
-            'z':     LaunchConfiguration('initial_z'),
-            'roll':  LaunchConfiguration('initial_roll'),
-            'pitch': LaunchConfiguration('initial_pitch'),
-            'yaw':   LaunchConfiguration('initial_yaw'),
-        }}],
-        output='screen',
-    )
-
+{spawn_block}
     bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
@@ -1180,8 +1268,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         *pose_args,
-        gazebo_action,
-        spawn,
+{ld_gazebo_spawn}
         bridge,
 {rsp_ld_entry}
         rviz,
@@ -1453,6 +1540,25 @@ if __name__ == '__main__':
         if self.with_controller:
             total_length = self.L1 + self.L2 + self.L3
 
+            # Xacro args for initial pose — same as passive mode.
+            for arg_name in ('initial_x', 'initial_y', 'initial_z',
+                             'initial_roll', 'initial_pitch', 'initial_yaw'):
+                ET.SubElement(robot, 'xacro:arg', name=arg_name, default='0.0')
+
+            # Fixed world→base_origin joint carries the initial pose.
+            # The OpaqueFunction in generate_launch_file() bakes the actual
+            # values into the URDF via xacro mappings before RSP reads it,
+            # so RSP publishes the correct initial TF from the very first frame.
+            # The movable base joints are relative to base_origin, so the
+            # teleop moves the catheter from the initial position.
+            ET.SubElement(robot, 'link', name='base_origin')
+            j_off = ET.SubElement(robot, 'joint', name='world_to_base_offset', type='fixed')
+            ET.SubElement(j_off, 'parent', link='world')
+            ET.SubElement(j_off, 'child',  link='base_origin')
+            ET.SubElement(j_off, 'origin',
+                          xyz='$(arg initial_x) $(arg initial_y) $(arg initial_z)',
+                          rpy='$(arg initial_roll) $(arg initial_pitch) $(arg initial_yaw)')
+
             def _vlink(name):
                 lk = ET.SubElement(robot, 'link', name=name)
                 inertial = ET.SubElement(lk, 'inertial')
@@ -1474,11 +1580,11 @@ if __name__ == '__main__':
                               damping=str(self.damping), friction=str(self.friction))
 
             _vlink('base_x_link')
-            _prismatic('base_x_joint', 'world',       'base_x_link', '1 0 0')
+            _prismatic('base_x_joint', 'base_origin', 'base_x_link', '1 0 0')
             _vlink('base_y_link')
-            _prismatic('base_y_joint', 'base_x_link', 'base_y_link', '0 1 0')
+            _prismatic('base_y_joint', 'base_x_link',  'base_y_link', '0 1 0')
             _vlink('base_z_link')
-            _prismatic('base_z_joint', 'base_y_link', 'base_z_link', '0 0 1')
+            _prismatic('base_z_joint', 'base_y_link',  'base_z_link', '0 0 1')
 
             j_rot = ET.SubElement(robot, 'joint', name='base_rotation_joint', type='revolute')
             ET.SubElement(j_rot, 'parent', link='base_z_link')
