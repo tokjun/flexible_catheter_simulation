@@ -6,7 +6,9 @@ A single generator script `catheter_generator.py` supports two modes:
 - **Passive mode** (default) — passive deformation simulation (observe catheter deflection under external forces)
 - **Active mode** (`--controller`) — active control simulation with a 4-DOF motorized base and keyboard teleoperation
 
-The script optionally accepts an anatomy STL file (`--anatomy-stl`) so the anatomical model is automatically visible in **both Gazebo and RViz** at a specified pose, with no manual placement required.
+The script optionally includes anatomical models in the generated package, making them visible in **both Gazebo and RViz** automatically:
+- **`--anatomy-stl`** — import a single STL file at a manually specified pose
+- **`--slicer-scene`** — import all models from a 3D Slicer MRML scene file, with their positions and orientations derived automatically from any linear transforms in the scene
 
 ---
 
@@ -20,8 +22,9 @@ The script optionally accepts an anatomy STL file (`--anatomy-stl`) so the anato
 - [Usage](#usage)
   - [Passive Catheter Simulation](#passive-catheter-simulation)
   - [Controlled Catheter Simulation with Keyboard Teleop](#controlled-catheter-simulation-with-keyboard-teleop)
-- [Including an Anatomy Model](#including-an-anatomy-model)
-  - [Automated (recommended)](#automated-recommended)
+- [Including Anatomy Models](#including-anatomy-models)
+  - [From a 3D Slicer MRML Scene (recommended)](#from-a-3d-slicer-mrml-scene-recommended)
+  - [Single STL file](#single-stl-file)
   - [Manual placement in Gazebo only (legacy)](#manual-placement-in-gazebo-only-legacy)
 - [Catheter Model Parameters](#catheter-model-parameters)
 - [References](#references)
@@ -36,22 +39,26 @@ The script optionally accepts an anatomy STL file (`--anatomy-stl`) so the anato
 ├── docs/
 │   └── images/                                 # Screenshots for README
 ├── catheter_generator.py                       # Unified generator (passive + active modes)
+├── slicer_scene/                               # Example 3D Slicer scene
+│   ├── 2026-04-14-Scene.mrml                   # MRML scene file (heart + aorta)
+│   ├── heart.stl                               # Heart surface mesh
+│   └── aorta.stl                               # Aorta surface mesh
 └── test_anatomy/                               # Example anatomical model (aortic arch)
     ├── meshes/                                 # Mesh files (.stl)
     ├── model.config                            # Gazebo model metadata
     └── model.sdf                               # Gazebo SDF model definition
 ```
 
-Each generator script produces a self-contained **ROS2 package** in the specified output directory:
+Each generator invocation produces a self-contained **ROS2 package** in the specified output directory:
 
 ```
 <output_package>/
 ├── package.xml
 ├── CMakeLists.txt
-├── urdf/               # Xacro robot description (includes anatomy link when configured)
+├── urdf/               # Xacro robot description (anatomy links added when configured)
 ├── sdf/                # Gazebo SDF model
-├── meshes/             # Auto-generated STL cylinder meshes + anatomy STL (when configured)
-├── worlds/             # Gazebo world file (includes anatomy model when configured)
+├── meshes/             # Auto-generated STL cylinder meshes + anatomy STLs (when configured)
+├── worlds/             # Gazebo world file (anatomy models embedded when configured)
 ├── launch/             # ROS2 launch file
 └── scripts/            # catheter_keyboard_teleop.py  (controller variant only)
 ```
@@ -106,14 +113,13 @@ python3 catheter_generator.py \
     --K 0.2 --M 0.5 --output my_catheter
 ```
 
-To include the aortic anatomy model at a specified pose:
+To include anatomy from a Slicer scene:
 
 ```bash
 python3 catheter_generator.py \
     --N 12 --D 0.003 --L1 0.20 --L2 0.5 --L3 0.05 \
     --K 0.2 --M 0.5 --output my_catheter \
-    --anatomy-stl /path/to/test_anatomy/meshes/Aortic_NIH3D_v2.stl \
-    --anatomy-x 0.0 --anatomy-y -0.02 --anatomy-z 0.56
+    --slicer-scene /path/to/slicer_scene/2026-04-14-Scene.mrml
 ```
 
 **Step 2: Build and launch**
@@ -145,15 +151,14 @@ python3 catheter_generator.py --controller \
     --output control_catheter_test
 ```
 
-To include the aortic anatomy model:
+To include anatomy from a Slicer scene:
 
 ```bash
 python3 catheter_generator.py --controller \
     --N 50 --D 0.003 --L1 0.04 --L2 0.5 --L3 0.01 \
     --K 10.0 --Kd 0.1 --Kf 0.01 --M 0.5 \
     --output control_catheter_test \
-    --anatomy-stl /path/to/test_anatomy/meshes/Aortic_NIH3D_v2.stl \
-    --anatomy-x 0.0 --anatomy-y -0.02 --anatomy-z 0.56
+    --slicer-scene /path/to/slicer_scene/2026-04-14-Scene.mrml
 ```
 
 **Step 2: Build and launch**
@@ -193,11 +198,48 @@ The teleop node publishes to the following ROS2 topics:
 
 ---
 
-## Including an Anatomy Model
+## Including Anatomy Models
 
-### Automated (recommended)
+### From a 3D Slicer MRML Scene (recommended)
 
-Pass `--anatomy-stl` to `catheter_generator.py`. The STL is copied into the package's `meshes/` directory and the anatomy is registered in both the URDF and the Gazebo world file — so it appears in **RViz and Gazebo automatically** at the pose you specify, with no manual drag-and-drop required.
+Pass `--slicer-scene` pointing to a `.mrml` file to import all `vtkMRMLModelNode` entries in the scene at once. Mesh files (STL or VTK) must live in the same directory as the `.mrml` file.
+
+```bash
+python3 catheter_generator.py \
+    --output my_catheter \
+    --slicer-scene slicer_scene/2026-04-14-Scene.mrml
+```
+
+**Transform support:** if a model is parented to a `vtkMRMLLinearTransformNode` in the scene, that transform (including nested chains) is applied automatically.
+
+**Coordinate handling:** SlicerROS2 maps the ROS world frame directly onto Slicer's RAS frame with no axis flip (ROS X = Slicer R, ROS Y = Slicer A, ROS Z = Slicer S). Because Slicer stores mesh files in LPS convention (L=+X, P=+Y, S=+Z), which differs from RAS by a 180° rotation about Z, the importer automatically negates X and Y of every mesh vertex when the storage node declares `coordinateSystem="LPS"` (the DICOM default). MRML transform matrices are in RAS and are therefore applied as-is to the ROS world frame, with only the translation scaled from millimetres to metres.
+
+**How it works:**
+
+- **URDF**: one fixed link (`anatomy_link_<name>`) and joint (`world_to_anatomy_<name>`) is added per model, parented to the `world` frame at the converted pose. `robot_state_publisher` broadcasts the TF frames, so RViz renders each model via the **RobotModel** display.
+- **Gazebo world SDF**: each anatomy model is embedded inline at its converted pose, so Gazebo loads all of them on startup.
+- **Launch file**: an `OpaqueFunction` resolves the installed paths of all anatomy meshes at launch time and patches the world SDF before passing it to Gazebo.
+- **Colors**: each model uses the display color from the Slicer scene (`vtkMRMLModelDisplayNode`).
+
+After building and launching, set the **Fixed Frame** in RViz to `world` and add a **RobotModel** display to see the catheter and all anatomy models together.
+
+> **Tip:** Use `--slicer-scale 0.001` (the default) if your Slicer models are in millimetres. Set `--slicer-scale 1.0` if they are already in metres.
+
+**Combining with `--anatomy-stl`:** if you need a model that is not in the MRML scene (e.g. an older STL at a manually specified pose), you can add `--anatomy-stl` alongside `--slicer-scene`. The STL is loaded first, followed by all models from the scene file. You do not need `--anatomy-stl` just to use the scene — the MRML file already records where each mesh is located.
+
+```bash
+python3 catheter_generator.py \
+    --output my_catheter \
+    --anatomy-stl test_anatomy/meshes/Aortic_NIH3D_v2.stl \
+    --anatomy-z 0.56 \
+    --slicer-scene slicer_scene/2026-04-14-Scene.mrml
+```
+
+---
+
+### Single STL file
+
+Pass `--anatomy-stl` to import one STL at a manually specified pose. The STL is copied into the package's `meshes/` directory and registered in both the URDF and the Gazebo world file.
 
 ```bash
 python3 catheter_generator.py \
@@ -207,15 +249,9 @@ python3 catheter_generator.py \
     --anatomy-roll 0.0 --anatomy-pitch 0.0 --anatomy-yaw 0.0
 ```
 
-**How it works:**
-
-- **URDF**: an `anatomy_link` is added as a fixed child of the `world` frame at the specified pose. `robot_state_publisher` broadcasts its TF, so RViz renders it via the **RobotModel** display.
-- **Gazebo world SDF**: the anatomy model is embedded inline at the same pose, so Gazebo loads it on startup.
-- **Launch file**: an `OpaqueFunction` resolves the installed path of the anatomy STL at launch time and patches the world SDF before handing it to Gazebo.
-
-After building and launching, set the **Fixed Frame** in RViz to `world` and add a **RobotModel** display to see both the catheter and the anatomy.
-
 > **Tip:** The default scale factor (`--anatomy-scale 0.001`) converts the STL from millimetres to metres, which matches the `test_anatomy` model. Adjust if your STL is already in metres.
+
+---
 
 ### Manual placement in Gazebo only (legacy)
 
@@ -255,7 +291,7 @@ In Gazebo:
 
 ## Catheter Model Parameters
 
-Both generator scripts share the following parameters:
+Both generator modes share the following parameters:
 
 | Parameter | Description | Unit | Default |
 |-----------|-------------|------|---------|
@@ -275,18 +311,20 @@ The controller variant adds two additional parameters:
 | `--Kd` | Joint damping coefficient | — | `0.1` |
 | `--Kf` | Joint friction coefficient | — | `0.01` |
 
-Both scripts also accept the following optional anatomy parameters:
+### Anatomy parameters
 
 | Parameter | Description | Unit | Default |
 |-----------|-------------|------|---------|
-| `--anatomy-stl` | Path to anatomy STL file | — | *(none)* |
+| `--slicer-scene` | Path to a 3D Slicer `.mrml` scene file; all models with their transforms are imported | — | *(none)* |
+| `--slicer-scale` | Mesh scale factor for Slicer scene models | — | `0.001` |
+| `--anatomy-stl` | Path to a single anatomy STL file | — | *(none)* |
 | `--anatomy-x` | Anatomy X position in world frame | m | `0.0` |
 | `--anatomy-y` | Anatomy Y position in world frame | m | `0.0` |
 | `--anatomy-z` | Anatomy Z position in world frame | m | `0.0` |
 | `--anatomy-roll` | Anatomy roll in world frame | rad | `0.0` |
 | `--anatomy-pitch` | Anatomy pitch in world frame | rad | `0.0` |
 | `--anatomy-yaw` | Anatomy yaw in world frame | rad | `0.0` |
-| `--anatomy-scale` | Mesh scale factor (mm→m conversion) | — | `0.001` |
+| `--anatomy-scale` | Mesh scale factor for `--anatomy-stl` | — | `0.001` |
 
 The catheter structure consists of a base link (length `L1`), a bending section of `N-2` uniformly distributed links (total length `L2`), and a tip link (length `L3`). Mass is distributed proportionally to each section's length. Spring stiffness decreases distally by a factor of 0.85 per joint to approximate the softer tip behavior of real catheters.
 
