@@ -1049,55 +1049,68 @@ ament_package()'''
         launch_arguments={{'gz_args': f'-r {{custom_world_file}}'}}.items(),
     )'''
 
-        # Passive mode: a custom broadcaster script publishes world → base_link
-        # on /tf (not /tf_static) at 10 Hz with current timestamps.
-        # Dynamic /tf entries have current timestamps which always take
-        # precedence over RSP's /tf_static entry (timestamp = 0).
+        # ── robot_state_publisher block ──────────────────────────────────────
+        # Passive mode: the initial pose is baked into the URDF at launch time
+        # via xacro args.  An OpaqueFunction resolves the launch args (which
+        # are strings) and passes them as xacro mappings so that RSP itself
+        # publishes the correct world→base_link on /tf_static.  This avoids
+        # any external broadcaster and any static-vs-dynamic TF conflict.
         #
-        # IMPORTANT: LaunchConfiguration resolves to a *string* (e.g. '0.3').
-        # Passing it directly as a Node parameter would cause a DOUBLE/STRING
-        # type mismatch in rclpy, silently falling back to the default 0.0.
-        # We therefore use OpaqueFunction to resolve the values as Python
-        # floats *before* creating the Node, so the parameters dict contains
-        # actual float values that match the declared DOUBLE type.
+        # Controller mode: the URDF has no fixed world joint (the base is
+        # driven by prismatic/revolute joints whose states come from Gazebo),
+        # so we process xacro once at description time with no mappings.
         if not self.with_controller:
-            initial_pose_tf_block = f'''
-    # ── Initial pose: world → base_link dynamic TF ──────────────────────────
-    # OpaqueFunction resolves the launch args as Python floats so the
-    # broadcaster receives DOUBLE parameters (not strings).
-    def _launch_broadcaster(context):
-        x     = float(LaunchConfiguration('initial_x').perform(context))
-        y     = float(LaunchConfiguration('initial_y').perform(context))
-        z     = float(LaunchConfiguration('initial_z').perform(context))
-        roll  = float(LaunchConfiguration('initial_roll').perform(context))
-        pitch = float(LaunchConfiguration('initial_pitch').perform(context))
-        yaw   = float(LaunchConfiguration('initial_yaw').perform(context))
+            rsp_block = f'''
+    # ── robot_state_publisher (passive) ─────────────────────────────────────
+    # OpaqueFunction is required because LaunchConfiguration resolves to a
+    # string at launch time; we pass those strings directly as xacro mappings
+    # so the initial pose is baked into the URDF before RSP reads it.
+    def _launch_rsp(context):
+        _pkg = get_package_share_directory('{package_name}')
+        _cfg = xacro.process_file(
+            os.path.join(_pkg, 'urdf', '{xacro_filename}'),
+            mappings={{
+                'initial_x':     LaunchConfiguration('initial_x').perform(context),
+                'initial_y':     LaunchConfiguration('initial_y').perform(context),
+                'initial_z':     LaunchConfiguration('initial_z').perform(context),
+                'initial_roll':  LaunchConfiguration('initial_roll').perform(context),
+                'initial_pitch': LaunchConfiguration('initial_pitch').perform(context),
+                'initial_yaw':   LaunchConfiguration('initial_yaw').perform(context),
+            }}
+        )
         return [Node(
-            package='{package_name}',
-            executable='catheter_pose_broadcaster.py',
-            name='catheter_pose_broadcaster',
-            parameters=[{{'x': x, 'y': y, 'z': z,
-                          'roll': roll, 'pitch': pitch, 'yaw': yaw}}],
-            output='screen',
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='robot_state_publisher',
+            output='both',
+            parameters=[{{'robot_description': _cfg.toxml()}}],
         )]
 
-    pose_broadcaster_action = OpaqueFunction(function=_launch_broadcaster)
+    rsp_action = OpaqueFunction(function=_launch_rsp)
 '''
-            ld_initial_pose_entry = '        pose_broadcaster_action,'
+            rsp_ld_entry = '        rsp_action,'
         else:
-            initial_pose_tf_block = ''
-            ld_initial_pose_entry = ''
-
-        event_handler_imports = (
-            'from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,\n'
-            '                             OpaqueFunction)'
-        )
+            rsp_block = f'''
+    # ── robot_state_publisher (controller) ──────────────────────────────────
+    config = xacro.process_file(
+        os.path.join(pkg_share, 'urdf', '{xacro_filename}')
+    )
+    rsp_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='both',
+        parameters=[{{'robot_description': config.toxml()}}],
+    )
+'''
+            rsp_ld_entry = '        rsp_node,'
 
         launch_content = f'''import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-{event_handler_imports}
+from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
+                             OpaqueFunction)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -1126,22 +1139,7 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_yaw',   default_value='0.0',
                               description='Catheter initial yaw   (rad)'),
     ]
-
-    # ── robot_state_publisher ────────────────────────────────────────────────
-    # Process the xacro once at launch-description time.  The initial pose is
-    # NOT baked into the URDF here; it is applied by catheter_pose_broadcaster
-    # (passive mode) or by the Gazebo spawn pose (controller mode).
-    config = xacro.process_file(
-        os.path.join(pkg_share, 'urdf', '{xacro_filename}')
-    )
-    rsp_node = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='both',
-        parameters=[{{'robot_description': config.toxml()}}],
-    )
-{initial_pose_tf_block}
+{rsp_block}
     rviz_config = os.path.join(pkg_share, 'config', 'rviz_config.rviz')
     rviz = Node(
         package='rviz2',
@@ -1185,8 +1183,7 @@ def generate_launch_description():
         gazebo_action,
         spawn,
         bridge,
-        rsp_node,
-{ld_initial_pose_entry}
+{rsp_ld_entry}
         rviz,
     ])
 '''
@@ -1494,13 +1491,20 @@ if __name__ == '__main__':
             ET.SubElement(j_rot, 'dynamics',
                           damping=str(self.damping), friction=str(self.friction))
         else:
-            # Passive: base_link is anchored to the world frame at the origin.
-            # The actual initial pose offset is applied by a static_transform_publisher
-            # launched alongside robot_state_publisher (see generate_launch_file).
+            # Passive: the initial pose is baked into the URDF at launch time.
+            # The OpaqueFunction in generate_launch_file() calls
+            # xacro.process_file() with initial_x/y/z/roll/pitch/yaw mappings
+            # before handing the URDF to robot_state_publisher, so RSP itself
+            # publishes the correct world→base_link on /tf_static.
+            for arg_name in ('initial_x', 'initial_y', 'initial_z',
+                             'initial_roll', 'initial_pitch', 'initial_yaw'):
+                ET.SubElement(robot, 'xacro:arg', name=arg_name, default='0.0')
             j_world = ET.SubElement(robot, 'joint', name='world_to_base', type='fixed')
             ET.SubElement(j_world, 'parent', link='world')
             ET.SubElement(j_world, 'child',  link='base_link')
-            ET.SubElement(j_world, 'origin', xyz='0 0 0', rpy='0 0 0')
+            ET.SubElement(j_world, 'origin',
+                          xyz='$(arg initial_x) $(arg initial_y) $(arg initial_z)',
+                          rpy='$(arg initial_roll) $(arg initial_pitch) $(arg initial_yaw)')
 
         # Flexible catheter joints
         if self.bending_links > 0:
